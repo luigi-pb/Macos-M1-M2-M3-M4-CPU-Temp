@@ -1,0 +1,1 @@
+# Macos-M1-M2-M3-M4-CPU-Temp
