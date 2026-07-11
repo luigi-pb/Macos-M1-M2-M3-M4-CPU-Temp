@@ -39,6 +39,33 @@ private func sysctlInt(_ name: String) -> Int? {
     return val
 }
 
+// MARK: - RAM Usage Reader
+
+private let sharedHost = mach_host_self()
+
+private func readRAMUsage() -> (usedGB: Double, totalGB: Double, percentage: Double)? {
+    var vmStats = vm_statistics64()
+    var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64>.size / MemoryLayout<integer_t>.size)
+    let result = withUnsafeMutablePointer(to: &vmStats) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+            host_statistics64(sharedHost, HOST_VM_INFO64, $0, &count)
+        }
+    }
+    guard result == KERN_SUCCESS else { return nil }
+    let pageSize = Double(vm_page_size)
+    let free = Double(vmStats.free_count) * pageSize
+    let active = Double(vmStats.active_count) * pageSize
+    let inactive = Double(vmStats.inactive_count) * pageSize
+    let speculative = Double(vmStats.speculative_count) * pageSize
+    let wired = Double(vmStats.wire_count) * pageSize
+    let compressed = Double(vmStats.compressor_page_count) * pageSize
+    let purgeable = Double(vmStats.purgeable_count) * pageSize
+    let total = free + active + inactive + speculative + wired + compressed
+    let used = active + wired + compressed + purgeable
+    guard total > 0 else { return nil }
+    return (used / 1_073_741_824, total / 1_073_741_824, used / total * 100)
+}
+
 // MARK: - Data
 
 struct SensorReading: Identifiable {
@@ -49,6 +76,7 @@ struct SensorReading: Identifiable {
 struct ClusterInfo {
     var sensors: [SensorReading] = []
     var avg: Double { sensors.isEmpty ? 0 : sensors.map(\.temp).reduce(0, +) / Double(sensors.count) }
+    var min: Double { sensors.map(\.temp).min() ?? 0 }
     var max: Double { sensors.map(\.temp).max() ?? 0 }
 }
 
@@ -79,9 +107,10 @@ final class TempMonitor: ObservableObject {
         hidSetMatch(client!, matching as CFDictionary)
 
         refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+        timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.refresh()
         }
+        RunLoop.current.add(timer!, forMode: .common)
     }
 
     deinit { timer?.invalidate() }
@@ -120,6 +149,34 @@ final class TempMonitor: ObservableObject {
     }
 }
 
+// MARK: - RAM Monitor
+
+final class RAMMonitor: ObservableObject {
+    @Published var percentage: Double = 0
+    @Published var usedGB: Double = 0
+    @Published var totalGB: Double = 0
+
+    private var timer: Timer?
+
+    init() {
+        refresh()
+        timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.refresh()
+        }
+        RunLoop.current.add(timer!, forMode: .common)
+    }
+
+    deinit { timer?.invalidate() }
+
+    func refresh() {
+        guard let ram = readRAMUsage() else { return }
+        percentage = ram.percentage
+        usedGB = ram.usedGB
+        totalGB = ram.totalGB
+        objectWillChange.send()
+    }
+}
+
 // MARK: - Launch at Login
 
 final class AppSettings: ObservableObject {
@@ -150,147 +207,218 @@ final class AppSettings: ObservableObject {
 struct CPUTempApp: App {
     @StateObject private var monitor = TempMonitor()
     @StateObject private var settings = AppSettings()
+    @StateObject private var ram = RAMMonitor()
+
+    // Driven by onReceive so the MenuBarExtra label re-renders
+    @State private var menuAvgText = "--"
+    @State private var menuMaxText = "--"
+    @State private var menuRamText = "0%"
 
     var body: some Scene {
         MenuBarExtra {
-            VStack(alignment: .leading, spacing: 0) {
-                // App header
-                HStack(spacing: 10) {
-                    Image(systemName: "thermometer.sun.fill")
-                        .font(.system(size: 24))
-                        .foregroundStyle(
-                            .linearGradient(colors: [.orange, .red], startPoint: .top, endPoint: .bottom)
-                        )
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text("CPU Temp")
-                            .font(.system(size: 13, weight: .semibold))
-                        Text(monitor.chipName)
-                            .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
+            MenuPanel()
+                .environmentObject(monitor)
+                .environmentObject(settings)
+                .environmentObject(ram)
+                .onReceive(monitor.objectWillChange) { _ in
+                    menuAvgText = monitor.avg.map { String(format: "%.0f\u{00B0}", $0) } ?? "--"
+                    menuMaxText = monitor.highest.map { String(format: "%.0f\u{00B0}", $0) } ?? "--"
                 }
-                .padding(.bottom, 12)
-
-                // AVG / MAX
-                HStack(spacing: 16) {
-                    SummaryCell(label: "AVG", value: monitor.avg)
-                    SummaryCell(label: "MAX", value: monitor.highest)
+                .onReceive(ram.objectWillChange) { _ in
+                    menuRamText = String(format: "%.0f%%", ram.percentage)
                 }
-                .padding(.bottom, 12)
-
-                // Performance cluster
-                if !monitor.pCluster.sensors.isEmpty {
-                    ClusterHeader(
-                        title: "Performance",
-                        cores: monitor.pCoreCount,
-                        avg: monitor.pCluster.avg,
-                        max: monitor.pCluster.max
-                    )
-                    SensorGrid(sensors: monitor.pCluster.sensors)
-                        .padding(.bottom, 8)
-                }
-
-                // Efficiency cluster
-                if !monitor.eCluster.sensors.isEmpty {
-                    ClusterHeader(
-                        title: "Efficiency",
-                        cores: monitor.eCoreCount,
-                        avg: monitor.eCluster.avg,
-                        max: monitor.eCluster.max
-                    )
-                    SensorGrid(sensors: monitor.eCluster.sensors)
-                }
-
-                Divider().padding(.top, 10)
-
-                // Settings
-                Toggle(isOn: $settings.launchAtLogin) {
-                    Label("Launch at Login", systemImage: "gear")
-                        .font(.system(size: 12))
-                }
-                .toggleStyle(.switch)
-                .controlSize(.small)
-                .padding(.top, 8)
-
-                Divider().padding(.top, 8)
-
-                Button("Quit") { NSApplication.shared.terminate(nil) }
-                    .keyboardShortcut("q")
-                    .padding(.top, 6)
-            }
-            .padding(16)
-            .frame(width: 240)
         } label: {
-            let avgText = monitor.avg.map { String(format: "%.0f\u{00B0}", $0) } ?? "--"
-            let maxText = monitor.highest.map { String(format: "%.0f\u{00B0}", $0) } ?? "--"
-            HStack(spacing: 2) {
+            HStack(spacing: 5) {
                 Image(systemName: "thermometer.medium")
-                VStack(alignment: .leading, spacing: -1) {
-                    Text(avgText)
-                        .font(.system(size: 9, weight: .medium, design: .monospaced))
-                    Text(maxText)
-                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                    .font(.system(size: 11, weight: .medium))
+                VStack(alignment: .leading, spacing: -2) {
+                    Text(menuAvgText)
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    Text(menuMaxText)
+                        .font(.system(size: 10, weight: .regular, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                RoundedRectangle(cornerRadius: 0.5)
+                    .fill(.tertiary)
+                    .frame(width: 1, height: 14)
+                HStack(spacing: 3) {
+                    Image(systemName: "memorychip")
+                        .font(.system(size: 10, weight: .medium))
+                    Text(menuRamText)
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
                 }
             }
+            .foregroundStyle(.primary)
         }
         .menuBarExtraStyle(.window)
     }
 }
 
-// MARK: - Views
+// MARK: - Menu Panel (dropdown)
 
-struct SummaryCell: View {
-    let label: String
-    let value: Double?
+private struct MenuPanel: View {
+    @EnvironmentObject var monitor: TempMonitor
+    @EnvironmentObject var settings: AppSettings
+    @EnvironmentObject var ram: RAMMonitor
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(label)
-                .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(.secondary)
-            Text(value.map { String(format: "%.0f\u{00B0}C", $0) } ?? "\u{2014}")
-                .font(.system(size: 22, weight: .semibold, design: .monospaced))
+        VStack(alignment: .leading, spacing: 0) {
+            // CPU header
+            HStack(spacing: 8) {
+                Image(systemName: "cpu")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.orange)
+                Text(monitor.chipName)
+                    .font(.system(size: 12, weight: .regular))
+                    .foregroundStyle(.white.opacity(0.75))
+                Spacer()
+                if let avg = monitor.avg {
+                    Text(String(format: "%.0f\u{00B0}", avg))
+                        .font(.system(size: 13, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.white)
+                }
+            }
+
+            Divider().background(.white.opacity(0.1)).padding(.vertical, 6)
+
+            // Performance cluster
+            if !monitor.pCluster.sensors.isEmpty {
+                ClusterRow(
+                    title: "P-Core",
+                    count: monitor.pCoreCount,
+                    avg: monitor.pCluster.avg,
+                    min: monitor.pCluster.min,
+                    max: monitor.pCluster.max
+                )
+            }
+
+            // Efficiency cluster
+            if !monitor.eCluster.sensors.isEmpty {
+                ClusterRow(
+                    title: "E-Core",
+                    count: monitor.eCoreCount,
+                    avg: monitor.eCluster.avg,
+                    min: monitor.eCluster.min,
+                    max: monitor.eCluster.max
+                )
+            }
+
+            Divider().background(.white.opacity(0.1)).padding(.vertical, 6)
+
+            // RAM
+            HStack(spacing: 8) {
+                Image(systemName: "memorychip")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.cyan)
+                Text("RAM")
+                    .font(.system(size: 12, weight: .regular))
+                    .foregroundStyle(.white.opacity(0.75))
+                Spacer()
+                Text(String(format: "%.1f / %.1f GB  %.0f%%", ram.usedGB, ram.totalGB, ram.percentage))
+                    .font(.system(size: 11, weight: .regular, design: .monospaced))
+                    .foregroundStyle(ramColor)
+            }
+            RAMBarView(percentage: ram.percentage)
+
+            Divider().background(.white.opacity(0.1)).padding(.vertical, 6)
+
+            // Footer
+            HStack {
+                Toggle("", isOn: $settings.launchAtLogin)
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                Text("Launch at Login")
+                    .font(.system(size: 11, weight: .regular))
+                    .foregroundStyle(.white.opacity(0.55))
+                Spacer()
+                Button("Quit") { NSApplication.shared.terminate(nil) }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11, weight: .regular))
+                    .foregroundStyle(.white.opacity(0.4))
+            }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .frame(width: 250)
+        .background(.ultraThinMaterial.opacity(0.95))
+    }
+
+    private var ramColor: Color {
+        ram.percentage > 85 ? .red : ram.percentage > 65 ? .orange : .green
     }
 }
 
-struct ClusterHeader: View {
+// MARK: - Views
+
+private struct ClusterRow: View {
     let title: String
-    let cores: Int
+    let count: Int
     let avg: Double
+    let min: Double
     let max: Double
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline) {
-            Text(title)
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .textCase(.uppercase)
-            Text("\u{00B7} \(cores) cores")
-                .font(.system(size: 10))
-                .foregroundStyle(.tertiary)
+        HStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.white)
+                Text("\(count) cores")
+                    .font(.system(size: 10, weight: .regular))
+                    .foregroundStyle(.white.opacity(0.4))
+            }
             Spacer()
-            Text(String(format: "%.0f\u{00B0} / %.0f\u{00B0}", avg, max))
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundStyle(.secondary)
+            StatPill(label: "min", value: min)
+            StatPill(label: "avg", value: avg)
+            StatPill(label: "max", value: max)
         }
-        .padding(.bottom, 4)
+        .padding(.vertical, 2)
     }
 }
 
-struct SensorGrid: View {
-    let sensors: [SensorReading]
+private struct StatPill: View {
+    let label: String
+    let value: Double
 
     var body: some View {
-        let columns = Array(repeating: GridItem(.flexible(), spacing: 4), count: 4)
-        LazyVGrid(columns: columns, spacing: 4) {
-            ForEach(sensors) { s in
-                Text(String(format: "%.0f\u{00B0}", s.temp))
-                    .font(.system(size: 11, weight: .medium, design: .monospaced))
-                    .frame(maxWidth: .infinity)
+        VStack(spacing: 1) {
+            Text(String(format: "%.0f\u{00B0}", value))
+                .font(.system(size: 12, weight: .medium, design: .monospaced))
+                .foregroundStyle(valueColor)
+            Text(label)
+                .font(.system(size: 9, weight: .regular))
+                .foregroundStyle(.white.opacity(0.35))
+        }
+        .frame(width: 40)
+    }
+
+    private var valueColor: Color {
+        switch value {
+        case ..<40: return .green
+        case ..<60: return .yellow
+        case ..<80: return .orange
+        default:    return .red
+        }
+    }
+}
+
+private struct RAMBarView: View {
+    let percentage: Double
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(.white.opacity(0.08))
+                Capsule()
+                    .fill(barColor.opacity(0.8))
+                    .frame(width: geo.size.width * min(percentage / 100.0, 1.0))
             }
         }
+        .frame(height: 3)
+        .padding(.top, 4)
+    }
+
+    private var barColor: Color {
+        percentage > 85 ? .red : percentage > 65 ? .orange : .green
     }
 }
